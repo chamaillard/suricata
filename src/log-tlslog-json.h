@@ -14,13 +14,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
  * 02110-1301, USA.
  */
-#ifndef __LOG_JSONTLSLOG_H__
-#define __LOG_JSONTLSLOG_H__
+#ifndef __LOG_TLS_JSONLOG_H__
+#define __LOG_LSL_JSON_OG_H__
 
-void TmModuleLogTlsLogJsonRegister (void);
-void TmModuleLogTlsLogJsonIPv4Register (void);
-void TmModuleLogTlsLogJsonIPv6Register (void);
-OutputCtx *LogTlsLogJsonInitCtx(ConfNode *);
+void TmModuleLogTlsJsonLogRegister (void);
+void TmModuleLogTlsJsonLogIPv4Register (void);
+void TmModuleLogTlsJsonLogIPv6Register (void);
+OutputCtx *LogTlsJsonLogInitCtx(ConfNode *);
 
 #endif /* __LOG_JSONTLSLOG_H__ */
 
