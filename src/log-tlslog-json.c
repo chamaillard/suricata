@@ -49,6 +49,7 @@
 #include "util-logopenfile.h"
 #include "util-crypt.h"
 
+#ifdef BUILD_UNIX_SOCKET
 #include <jansson.h>
 
 #define DEFAULT_LOG_FILENAME "tls-json.log"
@@ -213,158 +214,8 @@ static int GetIPInformations(Packet *p, char* srcip, size_t srcip_len,
     return 1;
 }
 
-static int CreateFileName(LogTlsJsonFileCtx *log, Packet *p, SSLState *state, char *filename)
-{
-
-#define FILELEN 64  //filename len + extention + ending path / + some space
-
-    int filenamelen = FILELEN + strlen(tls_logfile_base_dir);
-    int file_id = SC_ATOMIC_ADD(cert_id, 1);
-
-    if (filenamelen + 1 > PATH_MAX) {
-        return 0;
-    }
-
-    /* Use format : packet time + incremental ID
-     * When running on same pcap it will overwrite
-     * On a live device, we will not be able to overwrite */
-    snprintf(filename, filenamelen, "%s/%ld.%ld-%d.pem",
-             tls_logfile_base_dir,
-             p->ts.tv_sec,
-             (long int)p->ts.tv_usec,
-             file_id);
-    return 1;
-}
-
-
 static void LogTlsJsonLogPem(LogTlsJsonLogThread *aft, Packet *p, SSLState *state, LogTlsJsonFileCtx *log, int ipproto)
 {
-#define PEMHEADER "-----BEGIN CERTIFICATE-----\n"
-#define PEMFOOTER "-----END CERTIFICATE-----\n"
-    //Logging pem certificate
-    char filename[PATH_MAX] = "";
-    FILE* fp = NULL;
-    FILE* fpmeta = NULL;
-    unsigned long pemlen;
-    unsigned char* pembase64ptr = NULL;
-    int ret;
-    SSLCertsChain *cert;
-
-    if ((state->server_connp.cert_input == NULL) || (state->server_connp.cert_input_len == 0))
-        SCReturn;
-
-    CreateFileName(log, p, state, filename);
-    if (strlen(filename) == 0) {
-        SCLogWarning(SC_ERR_FOPEN, "Can't create PEM filename");
-        SCReturn;
-    }
-
-    fp = fopen(filename, "w");
-    if (fp == NULL) {
-        SCLogWarning(SC_ERR_FOPEN, "Can't create PEM file: %s", filename);
-        SCReturn;
-    }
-
-    TAILQ_FOREACH(cert, &state->server_connp.certs, next) {
-        pemlen = (4 * (cert->cert_len + 2) / 3) +1;
-        if (pemlen > aft->enc_buf_len) {
-            aft->enc_buf = (uint8_t*) SCRealloc(aft->enc_buf, sizeof(uint8_t) * pemlen);
-            if (aft->enc_buf == NULL) {
-                SCLogWarning(SC_ERR_MEM_ALLOC, "Can't allocate data for base64 encoding");
-                goto end_fp;
-            }
-            aft->enc_buf_len = pemlen;
-        }
-
-        memset(aft->enc_buf, 0, aft->enc_buf_len);
-
-        ret = Base64Encode((unsigned char*) cert->cert_data, cert->cert_len, aft->enc_buf, &pemlen);
-        if (ret != SC_BASE64_OK) {
-            SCLogWarning(SC_ERR_INVALID_ARGUMENTS, "Invalid return of Base64Encode function");
-            goto end_fwrite_fp;
-        }
-
-        if (fprintf(fp, PEMHEADER)  < 0)
-            goto end_fwrite_fp;
-
-        pembase64ptr = aft->enc_buf;
-        while (pemlen > 0) {
-            size_t loffset = pemlen >= 64 ? 64 : pemlen;
-            if (fwrite(pembase64ptr, 1, loffset, fp) != loffset)
-                goto end_fwrite_fp;
-            if (fwrite("\n", 1, 1, fp) != 1)
-                goto end_fwrite_fp;
-            pembase64ptr += 64;
-            if (pemlen < 64)
-                break;
-            pemlen -= 64;
-        }
-
-        if (fprintf(fp, PEMFOOTER) < 0)
-            goto end_fwrite_fp;
-    }
-    fclose(fp);
-
-    //Logging certificate informations
-    memcpy(filename + (strlen(filename) - 3), "meta", 4);
-    fpmeta = fopen(filename, "w");
-    if (fpmeta != NULL) {
-        #define PRINT_BUF_LEN 46
-        char srcip[PRINT_BUF_LEN], dstip[PRINT_BUF_LEN];
-        char timebuf[64];
-        Port sp, dp;
-        CreateTimeString(&p->ts, timebuf, sizeof(timebuf));
-        if (!GetIPInformations(p, srcip, PRINT_BUF_LEN, &sp, dstip, PRINT_BUF_LEN, &dp, ipproto))
-            goto end_fwrite_fpmeta;
-        if (fprintf(fpmeta, "TIME:              %s\n", timebuf) < 0)
-            goto end_fwrite_fpmeta;
-        if (p->pcap_cnt > 0) {
-            if (fprintf(fpmeta, "PCAP PKT NUM:      %"PRIu64"\n", p->pcap_cnt) < 0)
-                goto end_fwrite_fpmeta;
-        }
-        if (fprintf(fpmeta, "SRC IP:            %s\n", srcip) < 0)
-            goto end_fwrite_fpmeta;
-        if (fprintf(fpmeta, "DST IP:            %s\n", dstip) < 0)
-            goto end_fwrite_fpmeta;
-        if (fprintf(fpmeta, "PROTO:             %" PRIu32 "\n", p->proto) < 0)
-            goto end_fwrite_fpmeta;
-        if (PKT_IS_TCP(p) || PKT_IS_UDP(p)) {
-            if (fprintf(fpmeta, "SRC PORT:          %" PRIu16 "\n", sp) < 0)
-                goto end_fwrite_fpmeta;
-            if (fprintf(fpmeta, "DST PORT:          %" PRIu16 "\n", dp) < 0)
-                goto end_fwrite_fpmeta;
-        }
-
-        if (fprintf(fpmeta, "TLS SUBJECT:       %s\n"
-                    "TLS ISSUERDN:      %s\n"
-                    "TLS FINGERPRINT:   %s\n",
-                state->server_connp.cert0_subject,
-                state->server_connp.cert0_issuerdn,
-                state->server_connp.cert0_fingerprint) < 0)
-            goto end_fwrite_fpmeta;
-
-        fclose(fpmeta);
-    } else {
-        SCLogWarning(SC_ERR_FOPEN, "Can't open meta file: %s",
-                     filename);
-        SCReturn;
-    }
-
-    /* Reset the store flag */
-    state->server_connp.cert_log_flag &= ~SSL_TLS_LOG_PEM;
-    SCReturn;
-
-end_fwrite_fp:
-    fclose(fp);
-    SCLogWarning(SC_ERR_FWRITE, "Unable to write certificate");
-end_fwrite_fpmeta:
-    if (fpmeta) {
-        fclose(fpmeta);
-        SCLogWarning(SC_ERR_FWRITE, "Unable to write certificate metafile");
-    }
-    SCReturn;
-end_fp:
-    fclose(fp);
 }
 
 
@@ -620,3 +471,5 @@ static void LogTlsJsonLogDeInitCtx(OutputCtx *output_ctx)
     SCFree(tlslog_ctx);
     SCFree(output_ctx);
 }
+
+#endif

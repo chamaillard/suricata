@@ -16,11 +16,16 @@
  */
 #ifndef __LOG_TLS_JSONLOG_H__
 #define __LOG_LSL_JSON_OG_H__
+#ifdef BUILD_UNIX_SOCKET
+#include <jansson.h>
+#endif
 
+
+#ifdef BUILD_UNIX_SOCKET
 void TmModuleLogTlsJsonLogRegister (void);
 void TmModuleLogTlsJsonLogIPv4Register (void);
 void TmModuleLogTlsJsonLogIPv6Register (void);
 OutputCtx *LogTlsJsonLogInitCtx(ConfNode *);
-
+#endif
 #endif /* __LOG_JSONTLSLOG_H__ */
 

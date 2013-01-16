@@ -50,17 +50,26 @@
 #include "util-crypt.h"
 
 #define DEFAULT_LOG_FILENAME "tls.log"
+#define DEFAULT_STORE_DIRECTORY "cert"
+
 
 static char tls_logfile_base_dir[PATH_MAX] = "/tmp";
 SC_ATOMIC_DECLARE(unsigned int, cert_id);
 
 #define MODULE_NAME "LogTlsLog"
+#define MODULE_STORE_NAME "StoreTls"
 
 #define OUTPUT_BUFFER_SIZE 65535
 #define CERT_ENC_BUFFER_SIZE 2048
 
 #define LOG_TLS_DEFAULT     0
 #define LOG_TLS_EXTENDED    1
+
+TmEcode StoreTls(ThreadVars *, Packet *, void *, PacketQueue *, PacketQueue *);
+TmEcode StoreTlsThreadInit(ThreadVars *, void *, void **);
+TmEcode StoreTlsThreadDeinit(ThreadVars *, void *);
+void StoreTlsExitPrintStats(ThreadVars *, void *);
+static void StoreTlsDeInitCtx(OutputCtx *);
 
 TmEcode LogTlsLog(ThreadVars *, Packet *, void *, PacketQueue *, PacketQueue *);
 TmEcode LogTlsLogIPv4(ThreadVars *, Packet *, void *, PacketQueue *, PacketQueue *);
@@ -87,9 +96,24 @@ void TmModuleLogTlsLogRegister(void)
         OutputRegisterModule(MODULE_NAME, "tls-log", LogTlsLogInitCtx);
     else
         SCLogError(SC_ERR_COUNTER_EXCEEDED,"Number of logger TLS exceeded");
-    SC_ATOMIC_INIT(cert_id);
-}
 
+    tmm_modules[TMM_TLSSTORE].name = MODULE_STORE_NAME;
+    tmm_modules[TMM_TLSSTORE].ThreadInit = StoreTlsThreadInit;
+    tmm_modules[TMM_TLSSTORE].Func = StoreTls;
+    tmm_modules[TMM_TLSSTORE].ThreadExitPrintStats = StoreTlsExitPrintStats;
+    tmm_modules[TMM_TLSSTORE].ThreadDeinit = StoreTlsThreadDeinit;
+    tmm_modules[TMM_TLSSTORE].RegisterTests = NULL;
+    tmm_modules[TMM_TLSSTORE].cap_flags = 0;
+    AppLayerRegisterLogger(ALPROTO_TLS);
+    if(tmm_modules[TMM_LOGTLSLOG].index != -1) /* too many loggers cf:NB_MAX_LOGGER*/
+        OutputRegisterModule(MODULE_STORE_NAME, "tls-store", StoreTlsInitCtx);
+    else
+        SCLogError(SC_ERR_COUNTER_EXCEEDED,"Number of logger TLS exceeded");
+
+
+    SC_ATOMIC_INIT(cert_id);
+
+}
 void TmModuleLogTlsLogIPv4Register(void)
 {
     tmm_modules[TMM_LOGTLSLOG4].name = "LogTlsLogIPv4";
@@ -126,6 +150,8 @@ typedef struct LogTlsLogThread_ {
     uint8_t*   enc_buf;
     size_t     enc_buf_len;
 } LogTlsLogThread;
+
+
 
 static void CreateTimeString(const struct timeval *ts, char *str, size_t size)
 {
@@ -391,10 +417,6 @@ static TmEcode LogTlsLogIPWrapper(ThreadVars *tv, Packet *p, void *data, PacketQ
     if (ssl_state->server_connp.cert0_issuerdn == NULL || ssl_state->server_connp.cert0_subject == NULL)
         goto end;
 
-    if (ssl_state->server_connp.cert_log_flag & SSL_TLS_LOG_PEM) {
-        LogTlsLogPem(aft, p, ssl_state, hlog, ipproto);
-    }
-
     int r = AppLayerTransactionGetLoggedId(p->flow,tmm_modules[TMM_LOGTLSLOG].index);
 
     if (r != 0) {
@@ -470,6 +492,7 @@ TmEcode LogTlsLog(ThreadVars *tv, Packet *p, void *data, PacketQueue *pq, Packet
 
     SCReturnInt(TM_ECODE_OK);
 }
+
 
 TmEcode LogTlsLogThreadInit(ThreadVars *t, void *initdata, void **data)
 {
@@ -597,6 +620,194 @@ tlslog_error:
 filectx_error:
     LogFileFreeCtx(file_ctx);
     return NULL;
+}
+OutputCtx *StoreTlsInitCtx(ConfNode *conf)
+{
+    LogFileCtx* file_ctx = LogFileNewCtx();
+
+    if (file_ctx == NULL) {
+        SCLogError(SC_ERR_TLS_LOG_GENERIC, "StoreTlsInitCtx: Couldn't "
+        "create new file_ctx");
+        return NULL;
+    }
+
+    char *s_default_log_dir = NULL;
+    if (ConfGet("default-log-dir", &s_default_log_dir) != 1)
+        s_default_log_dir = DEFAULT_LOG_DIR;
+
+    const char *s_base_dir = NULL;
+    s_base_dir = ConfNodeLookupChildValue(conf, "certs-log-dir");
+    if (s_base_dir == NULL || strlen(s_base_dir) == 0) {
+        strlcpy(tls_logfile_base_dir,
+                s_default_log_dir, sizeof(tls_logfile_base_dir));
+    } else {
+        if (PathIsAbsolute(s_base_dir)) {
+            strlcpy(tls_logfile_base_dir,
+                    s_base_dir, sizeof(tls_logfile_base_dir));
+        } else {
+            snprintf(tls_logfile_base_dir, sizeof(tls_logfile_base_dir),
+                    "%s/%s", s_default_log_dir, s_base_dir);
+        }
+    }
+
+    if (SCConfLogOpenGeneric(conf, file_ctx, DEFAULT_LOG_FILENAME) < 0) {
+        goto filectx_error;
+    }
+
+    LogTlsFileCtx *tlslog_ctx = SCCalloc(1, sizeof(LogTlsFileCtx));
+    if (unlikely(tlslog_ctx == NULL))
+        goto filectx_error;
+    tlslog_ctx->file_ctx = file_ctx;
+
+    const char *extended = ConfNodeLookupChildValue(conf, "extended");
+    if (extended == NULL) {
+        tlslog_ctx->flags |= LOG_TLS_DEFAULT;
+    } else {
+        if (ConfValIsTrue(extended)) {
+            tlslog_ctx->flags |= LOG_TLS_EXTENDED;
+        }
+    }
+
+    OutputCtx *output_ctx = SCCalloc(1, sizeof(OutputCtx));
+    if (unlikely(output_ctx == NULL))
+        goto tlslog_error;
+    output_ctx->data = tlslog_ctx;
+    output_ctx->DeInit = StoreTlsDeInitCtx;
+
+    SCLogDebug("TLS log output initialized");
+
+    return output_ctx;
+
+tlslog_error:
+    if (tlslog_ctx != NULL)
+        SCFree(tlslog_ctx);
+filectx_error:
+    LogFileFreeCtx(file_ctx);
+    return NULL;
+}
+
+
+/******************************************* STORE TLS ***************************/
+/*********************************************************************************/
+typedef struct StoreTlsFileCtx_ {
+    LogFileCtx *file_ctx;
+    uint32_t flags; /** Store mode */
+} StoreTlsFileCtx;
+
+typedef struct StoreTlsThread_ {
+    StoreTlsFileCtx *tlslog_ctx;
+
+    /** LogTlsFileCtx has the pointer to the file and a mutex to allow multithreading */
+    uint32_t tls_cnt;
+
+    MemBuffer *buffer;
+    uint8_t*   enc_buf;
+    size_t     enc_buf_len;
+} StoreTlsThread;
+
+TmEcode StoreTls(ThreadVars *tv, Packet *p, void *data, PacketQueue *pq, PacketQueue *postpq)
+{
+    SCEnter();
+     /* no flow, no htp state */
+    if (p->flow == NULL) {
+        SCReturnInt(TM_ECODE_OK);
+    }
+
+    if (!(PKT_IS_TCP(p))) {
+        SCReturnInt(TM_ECODE_OK);
+    }
+    /* check if we have TLS state or not */
+    FLOWLOCK_WRLOCK(p->flow);
+    uint16_t proto = AppLayerGetProtoFromPacket(p);
+    if (proto != ALPROTO_TLS)
+        goto end;
+
+    SSLState *ssl_state = (SSLState *) AppLayerGetProtoStateFromPacket(p);
+    if (ssl_state == NULL) {
+        SCLogDebug("no tls state, so no request logging");
+        goto end;
+    }
+
+
+    if (ssl_state->server_connp.cert0_issuerdn == NULL || ssl_state->server_connp.cert0_subject == NULL)
+        goto end;
+
+    if (ssl_state->server_connp.cert_log_flag & SSL_TLS_LOG_PEM) {
+        int ipproto=(PKT_IS_IPV6(p))?AF_INET6:AF_INET;
+        StoreTlsThread *aft = (LogTlsLogThread *) data;
+        LogTlsFileCtx *hlog = aft->tlslog_ctx;
+        LogTlsLogPem(aft, p, ssl_state, hlog, ipproto);
+    }
+end:
+    FLOWLOCK_UNLOCK(p->flow);
+    SCReturnInt(TM_ECODE_OK);
+}
+
+
+TmEcode StoreTlsThreadInit(ThreadVars *t, void *initdata, void **data)
+{
+    LogTlsLogThread *aft = SCMalloc(sizeof(LogTlsLogThread));
+    if (unlikely(aft == NULL))
+        return TM_ECODE_FAILED;
+    memset(aft, 0, sizeof(LogTlsLogThread));
+
+    if (initdata == NULL) {
+        SCLogDebug( "Error getting context for TLSLog.  \"initdata\" argument NULL");
+        SCFree(aft);
+        return TM_ECODE_FAILED;
+    }
+
+    aft->buffer = MemBufferCreateNew(OUTPUT_BUFFER_SIZE);
+    if (aft->buffer == NULL) {
+        SCFree(aft);
+        return TM_ECODE_FAILED;
+    }
+
+    aft->enc_buf = SCMalloc(CERT_ENC_BUFFER_SIZE);
+    if (aft->enc_buf == NULL) {
+        SCFree(aft);
+        return TM_ECODE_FAILED;
+    }
+    aft->enc_buf_len = CERT_ENC_BUFFER_SIZE;
+    memset(aft->enc_buf, 0, aft->enc_buf_len);
+
+    /* Use the Ouptut Context (file pointer and mutex) */
+    aft->tlslog_ctx = ((OutputCtx *) initdata)->data;
+
+    *data = (void *) aft;
+    return TM_ECODE_OK;
+}
+
+TmEcode StoreTlsThreadDeinit(ThreadVars *t, void *data)
+{
+    StoreTlsThread *aft = (StoreTlsThread *) data;
+    if (aft == NULL) {
+        return TM_ECODE_OK;
+    }
+
+    MemBufferFree(aft->buffer);
+    /* clear memory */
+    memset(aft, 0, sizeof(StoreTlsThread));
+
+    SCFree(aft);
+    return TM_ECODE_OK;
+}
+void StoreTlsExitPrintStats(ThreadVars *tv, void *data)
+{
+    StoreTlsThread *aft = (StoreTlsThread *) data;
+    if (aft == NULL) {
+        return;
+    }
+
+    SCLogInfo("TLS logger logged %" PRIu32 " requests", aft->tls_cnt);
+}
+
+static void StoreTlsDeInitCtx(OutputCtx *output_ctx)
+{
+    StoreTlsFileCtx *tlslog_ctx = (StoreTlsFileCtx *) output_ctx->data;
+    LogFileFreeCtx(tlslog_ctx->file_ctx);
+    SCFree(tlslog_ctx);
+    SCFree(output_ctx);
 }
 
 static void LogTlsLogDeInitCtx(OutputCtx *output_ctx)
